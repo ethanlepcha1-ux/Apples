@@ -1,7 +1,8 @@
 import os
 from flask import Flask, request, jsonify, render_template
 from dotenv import load_dotenv
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 # Load environment variables from .env file
 load_dotenv()
@@ -68,17 +69,21 @@ BEHAVIOR
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Gemini Setup
+# The client is created lazily inside the route so Vercel doesn't crash
+# during the build phase before environment variables are injected.
 # ──────────────────────────────────────────────────────────────────────────────
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY is not set. Add it to your .env file.")
+MODEL_NAME = "gemini-2.0-flash"
 
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel(
-    model_name="gemini-3.5-flash-lite",
-    system_instruction=SYSTEM_PROMPT,
-)
+def get_client():
+    """Return a Gemini client, raising a clear error if the key is missing."""
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "GEMINI_API_KEY is not set. "
+            "Add it to your .env file locally, or to Vercel's Environment Variables."
+        )
+    return genai.Client(api_key=api_key)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Routes
@@ -108,21 +113,44 @@ def chat():
     data = request.get_json()
 
     user_message = data.get("message", "").strip()
-    history = data.get("history", [])
+    history = data.get("history", [])  # list of {role, parts} dicts
 
     if not user_message:
         return jsonify({"error": "Message cannot be empty."}), 400
 
-    # Start a chat session with the existing history
-    chat_session = model.start_chat(history=history)
+    try:
+        client = get_client()
 
-    # Send the new message
-    response = chat_session.send_message(user_message)
+        # Convert history to the format the new SDK expects
+        formatted_history = [
+            types.Content(
+                role=turn["role"],
+                parts=[types.Part(text=p) for p in turn["parts"]],
+            )
+            for turn in history
+        ]
 
-    return jsonify({"reply": response.text})
+        # Send message with full conversation history and system prompt
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=formatted_history + [
+                types.Content(role="user", parts=[types.Part(text=user_message)])
+            ],
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+            ),
+        )
+
+        return jsonify({"reply": response.text})
+
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 500
+    except Exception as e:
+        return jsonify({"error": "Something went wrong. Please try again."}), 500
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    # debug=False in production; Vercel handles this automatically
+    app.run(debug=os.getenv("FLASK_DEBUG", "false").lower() == "true")
